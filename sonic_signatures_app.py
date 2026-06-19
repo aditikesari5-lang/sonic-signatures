@@ -409,10 +409,13 @@ def main():
         st.subheader("STFT parameters")
         st.caption(f"N_FFT={N_FFT} | Hop={HOP_LENGTH} | SR={SAMPLE_RATE}")
 
-    if not os.path.isdir(songs_path):
+    if not os.path.exists(DB_FILE) and not os.path.isdir(songs_path):
         st.error(f"Folder `{songs_path}` not found. "
                  f"Place your .mp3 files there and refresh.")
         st.stop()
+
+    if not os.path.isdir(songs_path):
+        os.makedirs(songs_path, exist_ok=True)
 
     with st.spinner("Loading fingerprint database…"):
         db = build_database(songs_folder=songs_path, db_file=DB_FILE)
