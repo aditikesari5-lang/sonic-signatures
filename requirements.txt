@@ -1,5 +1,6 @@
 numpy
 scipy
 matplotlib
-pydub
+soundfile
+audioread
 streamlit
