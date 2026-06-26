@@ -1,7 +1,8 @@
 """
 =============================================================
 Q3A & Q3B – Sonic Signatures / Signals to Softwares
-Audio fingerprinting – works on Python 3.12 / 3.13 / 3.14
+EE200: Audio Fingerprinting
+Works on Python 3.12 / 3.13 / 3.14
 NO pydub, NO librosa, NO audioop, NO numba
 Uses subprocess + ffmpeg to decode audio directly
 =============================================================
@@ -14,6 +15,7 @@ import io
 import tempfile
 import subprocess
 import struct
+import base64
 
 import numpy as np
 from scipy.ndimage import maximum_filter
@@ -22,6 +24,7 @@ from scipy.signal import spectrogram as scipy_spectrogram
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 
 import streamlit as st
 
@@ -29,41 +32,36 @@ import streamlit as st
 #  GLOBAL CONSTANTS
 # ─────────────────────────────────────────────────────────
 
-SAMPLE_RATE    = 22050   # Hz – all audio resampled here
-N_FFT          = 2048    # STFT window size in samples
-HOP_LENGTH     = 512     # step between windows
-N_PEAKS        = 10      # max constellation peaks per time frame
-FAN_VALUE      = 5       # pairs per anchor peak
-MIN_TIME_DELTA = 1       # min frame gap between anchor and target
-MAX_TIME_DELTA = 100     # max frame gap (target zone)
-FREQ_RANGE     = 200     # max freq-bin gap between anchor and target
+SAMPLE_RATE    = 22050
+N_FFT          = 2048
+HOP_LENGTH     = 512
+N_PEAKS        = 10
+FAN_VALUE      = 5
+MIN_TIME_DELTA = 1
+MAX_TIME_DELTA = 100
+FREQ_RANGE     = 200
 DB_FILE        = "fingerprint_db.pkl"
+META_FILE      = "fingerprint_meta.pkl"   # stores per-song metadata & thumbnail
 SONGS_FOLDER   = "songs"
 
 # ─────────────────────────────────────────────────────────
 #  AUDIO LOADING via ffmpeg subprocess
-#  Works on Python 3.14 – no audioop, no pydub needed
 # ─────────────────────────────────────────────────────────
 
 def _ffmpeg_to_pcm(input_path):
     """
-    Call ffmpeg as a subprocess to decode any audio file to
-    raw 16-bit signed PCM at SAMPLE_RATE Hz, mono channel.
-
-    ffmpeg handles: mp3, wav, flac, ogg, m4a, aac, and more.
-    Returns raw bytes of 16-bit PCM samples.
+    Decode any audio file to raw 16-bit mono PCM at SAMPLE_RATE Hz
+    using ffmpeg as a subprocess. No Python audio library needed.
     """
     cmd = [
-        "ffmpeg",
-        "-v", "quiet",          # suppress ffmpeg console output
-        "-i", input_path,       # input file path
-        "-f", "s16le",          # output format: signed 16-bit little-endian PCM
-        "-acodec", "pcm_s16le", # audio codec: raw PCM
-        "-ar", str(SAMPLE_RATE),# resample to our target sample rate
-        "-ac", "1",             # mix down to mono (1 channel)
-        "pipe:1"                # send output to stdout (pipe) instead of a file
+        "ffmpeg", "-v", "quiet",
+        "-i", input_path,
+        "-f", "s16le",
+        "-acodec", "pcm_s16le",
+        "-ar", str(SAMPLE_RATE),
+        "-ac", "1",
+        "pipe:1"
     ]
-    # Run ffmpeg and capture its stdout (the raw PCM bytes)
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode != 0:
         raise RuntimeError(
@@ -75,72 +73,48 @@ def _ffmpeg_to_pcm(input_path):
 def load_audio(source):
     """
     Load audio from a file path (str) or raw bytes / BytesIO.
-    Returns (y, sr) where y is a float32 numpy array in [-1, 1].
-
-    Strategy:
-      - If source is bytes/BytesIO: write to a temp file first,
-        because ffmpeg needs a real file path to read from.
-      - Then call _ffmpeg_to_pcm() to get raw PCM bytes.
-      - Convert int16 bytes → float32 array normalised to [-1, 1].
+    Returns (y, sr) where y is float32 in [-1, 1].
     """
-    # ── Handle bytes / BytesIO (uploaded file from Streamlit) ──
     if isinstance(source, (bytes, bytearray)):
         source = io.BytesIO(source)
 
     if hasattr(source, "read"):
-        # It's a file-like object; write it to a temp file on disk
         source.seek(0)
         raw_data = source.read()
-        # Use .mp3 suffix so ffmpeg knows the format
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
             tmp.write(raw_data)
             tmp_path = tmp.name
         try:
             pcm_bytes = _ffmpeg_to_pcm(tmp_path)
         finally:
-            os.unlink(tmp_path)   # always delete the temp file
+            os.unlink(tmp_path)
     else:
-        # It's already a file path string
         pcm_bytes = _ffmpeg_to_pcm(str(source))
 
-    # Convert raw 16-bit PCM bytes to numpy int16 array
-    # Each sample is 2 bytes (little-endian signed 16-bit integer)
     n_samples = len(pcm_bytes) // 2
     samples = struct.unpack(f"<{n_samples}h", pcm_bytes)
-    y = np.array(samples, dtype=np.float32)
-
-    # Normalise to [-1.0, 1.0] — int16 range is [-32768, 32767]
-    y /= 32768.0
-
+    y = np.array(samples, dtype=np.float32) / 32768.0
     return y, SAMPLE_RATE
 
 
 # ─────────────────────────────────────────────────────────
 #  STEP 1 – SPECTROGRAM
-#  Converts raw audio → 2-D time-frequency image
 # ─────────────────────────────────────────────────────────
 
 def compute_spectrogram(y, sr):
-    """
-    Short-Time Fourier Transform (STFT).
-    Slides an N_FFT-sample window along the signal,
-    takes the DFT of each slice, stacks them into a 2-D matrix.
-    Returns S_db (freq × time in dB), freqs (Hz), times (s).
-    """
+    """STFT: slides N_FFT window along signal, returns dB spectrogram."""
     freqs, times, Sxx = scipy_spectrogram(
-        y,
-        fs=sr,
+        y, fs=sr,
         nperseg=N_FFT,
         noverlap=N_FFT - HOP_LENGTH,
         scaling="spectrum",
     )
-    # Convert power to decibels; +1e-10 avoids log(0)
     S_db = 10 * np.log10(Sxx + 1e-10)
     return S_db, freqs, times
 
 
 def plot_spectrogram(S_db, freqs, times, title="Spectrogram"):
-    """Plot the spectrogram as a colour map and return the figure."""
+    """Return a matplotlib figure of the spectrogram."""
     fig, ax = plt.subplots(figsize=(10, 4))
     img = ax.pcolormesh(times, freqs, S_db, shading="auto", cmap="magma")
     fig.colorbar(img, ax=ax, label="Power (dB)")
@@ -156,16 +130,10 @@ def plot_spectrogram(S_db, freqs, times, title="Spectrogram"):
 # ─────────────────────────────────────────────────────────
 
 def extract_peaks(S_db, n_peaks=N_PEAKS):
-    """
-    Find local maxima in the spectrogram (the constellation).
-    A local max is a cell larger than all neighbours in a
-    20-cell window.  We keep only the top n_peaks per time frame.
-    Returns list of (freq_bin, time_frame) tuples.
-    """
+    """Find local maxima in spectrogram. Returns list of (freq_bin, time_frame)."""
     local_max = maximum_filter(S_db, size=20) == S_db
-    strong    = S_db > S_db.max() - 60      # at least –60 dB below peak
+    strong    = S_db > S_db.max() - 60
     peak_mask = local_max & strong
-
     freq_indices, time_indices = np.where(peak_mask)
     peaks = []
     for t in np.unique(time_indices):
@@ -179,13 +147,13 @@ def extract_peaks(S_db, n_peaks=N_PEAKS):
 
 
 def plot_constellation(S_db, freqs, times, peaks, title="Constellation"):
-    """Overlay constellation peaks (cyan dots) on the spectrogram."""
+    """Overlay cyan peak dots on spectrogram."""
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.pcolormesh(times, freqs, S_db, shading="auto", cmap="magma", alpha=0.7)
     pt = [times[t] if t < len(times) else times[-1] for (f, t) in peaks]
     pf = [freqs[f] if f < len(freqs) else freqs[-1] for (f, t) in peaks]
     ax.scatter(pt, pf, s=15, c="cyan", marker="o", linewidths=0.5,
-               label="Constellation peaks")
+               label=f"{len(peaks)} peaks")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Frequency (Hz)")
     ax.set_title(title)
@@ -194,16 +162,49 @@ def plot_constellation(S_db, freqs, times, peaks, title="Constellation"):
     return fig
 
 
+def make_constellation_thumbnail(peaks, n_time_frames, n_freq_bins, size=(180, 120)):
+    """
+    Generate a small dark constellation image (scatter plot of peaks only,
+    no axes) as a PNG bytes object — used for the Library grid cards.
+    Each peak is coloured by its frequency (low=teal, high=yellow/pink),
+    matching the style shown in the demo video.
+    """
+    fig, ax = plt.subplots(figsize=(size[0]/72, size[1]/72), dpi=72)
+    fig.patch.set_facecolor("#0d1117")   # dark background
+    ax.set_facecolor("#0d1117")
+
+    if peaks:
+        ts = np.array([t for (f, t) in peaks], dtype=float)
+        fs = np.array([f for (f, t) in peaks], dtype=float)
+        # Normalise for colouring
+        fs_norm = fs / (n_freq_bins + 1e-6)
+        # Use a colormap that goes teal → yellow → magenta (like the demo)
+        cmap = mcolors.LinearSegmentedColormap.from_list(
+            "demo", ["#00ffcc", "#ffe066", "#ff66cc"])
+        colors = cmap(fs_norm)
+        ax.scatter(ts, fs, s=1.5, c=colors, alpha=0.85, linewidths=0)
+
+    ax.set_xlim(0, max(n_time_frames, 1))
+    ax.set_ylim(0, max(n_freq_bins, 1))
+    ax.axis("off")
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=72,
+                facecolor=fig.get_facecolor(), bbox_inches="tight", pad_inches=0)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
 # ─────────────────────────────────────────────────────────
 #  STEP 3 – FINGERPRINTING  (hash generation)
 # ─────────────────────────────────────────────────────────
 
 def generate_hashes(peaks, fan_value=FAN_VALUE):
     """
-    Convert constellation into (hash, anchor_time) pairs.
-    Each hash encodes (f1, f2, delta_t) as a single integer:
-        hash = f1 * 10^10 + f2 * 10^5 + delta_t
-    Using pairs is much more specific than single peaks alone.
+    Pair anchor peaks with nearby targets in a target zone.
+    Hash = f1 * 10^10 + f2 * 10^5 + delta_t
     """
     hashes = []
     peaks_sorted = sorted(peaks, key=lambda x: x[1])
@@ -227,30 +228,38 @@ def generate_hashes(peaks, fan_value=FAN_VALUE):
 
 
 # ─────────────────────────────────────────────────────────
-#  STEP 4 – DATABASE
+#  STEP 4 – DATABASE  (index & persist)
 # ─────────────────────────────────────────────────────────
 
-def build_database(songs_folder=SONGS_FOLDER, db_file=DB_FILE):
+def build_database(songs_folder=SONGS_FOLDER, db_file=DB_FILE, meta_file=META_FILE):
     """
-    Index every .mp3 / .wav file and save fingerprint database.
-    Database format: { hash_int: [(song_name, anchor_time), ...] }
-    Saved to disk as a pickle file so next run loads instantly.
+    Index every .mp3/.wav file. Saves two files:
+      - fingerprint_db.pkl   : hash → [(song_name, anchor_time), ...]
+      - fingerprint_meta.pkl : song_name → {hash_count, thumbnail_png_bytes,
+                                            n_peaks, duration_s}
     """
-    # Load from disk if already built
-    if os.path.exists(db_file):
+    if os.path.exists(db_file) and os.path.exists(meta_file):
         with open(db_file, "rb") as f:
-            return pickle.load(f)
+            db = pickle.load(f)
+        with open(meta_file, "rb") as f:
+            meta = pickle.load(f)
+        return db, meta
 
-    db = {}
+    db   = {}
+    meta = {}
+
     os.makedirs(songs_folder, exist_ok=True)
-    audio_files = [fn for fn in os.listdir(songs_folder)
-                   if fn.lower().endswith((".mp3", ".wav", ".flac", ".ogg"))]
+    audio_files = sorted([
+        fn for fn in os.listdir(songs_folder)
+        if fn.lower().endswith((".mp3", ".wav", ".flac", ".ogg"))
+    ])
 
     if not audio_files:
         st.error(f"No audio files found in '{songs_folder}' folder.")
-        return db
+        return db, meta
 
     progress = st.progress(0, text="Indexing songs…")
+
     for idx, filename in enumerate(audio_files):
         song_name = os.path.splitext(filename)[0]
         path      = os.path.join(songs_folder, filename)
@@ -259,17 +268,38 @@ def build_database(songs_folder=SONGS_FOLDER, db_file=DB_FILE):
             S_db, freqs, times = compute_spectrogram(y, sr)
             peaks  = extract_peaks(S_db)
             hashes = generate_hashes(peaks)
+
+            # Store hashes in main DB
             for (h, t) in hashes:
                 db.setdefault(h, []).append((song_name, t))
+
+            # Generate thumbnail constellation image
+            thumb_bytes = make_constellation_thumbnail(
+                peaks,
+                n_time_frames=S_db.shape[1],
+                n_freq_bins=S_db.shape[0]
+            )
+
+            meta[song_name] = {
+                "hash_count" : len(hashes),
+                "n_peaks"    : len(peaks),
+                "duration_s" : round(len(y) / sr, 1),
+                "thumbnail"  : thumb_bytes,   # PNG bytes
+            }
+
         except Exception as e:
             st.warning(f"Skipped {filename}: {e}")
+
         progress.progress((idx + 1) / len(audio_files),
                           text=f"Indexed: {song_name}")
 
     with open(db_file, "wb") as f:
         pickle.dump(db, f)
+    with open(meta_file, "wb") as f:
+        pickle.dump(meta, f)
+
     progress.empty()
-    return db
+    return db, meta
 
 
 # ─────────────────────────────────────────────────────────
@@ -278,10 +308,9 @@ def build_database(songs_folder=SONGS_FOLDER, db_file=DB_FILE):
 
 def match_query(query_y, query_sr, db):
     """
-    Identify which song the query clip came from.
-    For every query hash found in the database, vote for
-    (song, db_time − query_time).  The true song gets a spike
-    at one offset; wrong songs get only scattered votes.
+    Offset histogram voting:
+    For each query hash found in DB, record db_time − query_time.
+    The true song gets a huge spike at one offset; wrong songs scatter.
     """
     S_db, freqs, times = compute_spectrogram(query_y, query_sr)
     peaks  = extract_peaks(S_db)
@@ -311,10 +340,7 @@ def match_query(query_y, query_sr, db):
 
 
 def plot_offset_histogram(offset_dict, best_song):
-    """
-    Bar chart of offset votes for top 3 candidate songs.
-    True match → one huge bar. Wrong song → scattered small bars.
-    """
+    """Bar chart — true match has one huge bar, others are scattered."""
     top_songs = sorted(offset_dict.items(),
                        key=lambda kv: max(kv[1].values()),
                        reverse=True)[:3]
@@ -338,7 +364,7 @@ def plot_offset_histogram(offset_dict, best_song):
 # ─────────────────────────────────────────────────────────
 
 def run_batch_mode(query_files, db):
-    """Run matching on multiple uploaded files, return list of dicts."""
+    """Match multiple uploaded files, return list of result dicts."""
     rows = []
     for uploaded in query_files:
         y, sr = load_audio(uploaded.read())
@@ -362,110 +388,257 @@ def write_results_csv(rows, path="results.csv"):
 # ─────────────────────────────────────────────────────────
 
 def main():
-    st.set_page_config(page_title="Sonic Signatures – EE200",
-                       page_icon="🎵", layout="wide")
-    st.title("🎵 Sonic Signatures")
-    st.markdown("**EE200 Q3A & Q3B** – Audio fingerprinting via spectrogram "
-                "peaks & hash matching.")
+    st.set_page_config(
+        page_title="EE200: Audio Fingerprinting",
+        page_icon="🎵",
+        layout="wide"
+    )
+
+    # ── Custom CSS for dark card style ───────────────────
+    st.markdown("""
+    <style>
+    .song-card {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        padding: 8px;
+        margin-bottom: 10px;
+        text-align: center;
+    }
+    .song-card img {
+        width: 100%;
+        border-radius: 4px;
+        display: block;
+    }
+    .song-title {
+        color: #e6edf3;
+        font-size: 13px;
+        font-weight: 600;
+        margin-top: 6px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .song-hashes {
+        color: #8b949e;
+        font-size: 11px;
+        margin-top: 2px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # ── Header ───────────────────────────────────────────
+    st.markdown("## 🎵 EE**200**: Audio Fingerprinting")
+    st.caption("SIGNALS, SYSTEMS & NETWORKS · PROJECT DEMO")
+    st.write("Index a library of songs as spectrogram fingerprints, "
+             "then identify any short clip against it.")
+    st.markdown("---")
 
     # ── Sidebar ──────────────────────────────────────────
     with st.sidebar:
         st.header("⚙️ Settings")
-        songs_path = st.text_input("Songs folder path", value=SONGS_FOLDER)
-        if st.button("🔄 Re-index songs"):
-            if os.path.exists(DB_FILE):
-                os.remove(DB_FILE)
-                st.success("Database cleared. Will re-index now.")
+        songs_path = st.text_input("Songs folder", value=SONGS_FOLDER)
+        if st.button("🔄 Re-index (rebuild DB)"):
+            for f in [DB_FILE, META_FILE]:
+                if os.path.exists(f):
+                    os.remove(f)
+            st.success("Database cleared. Reload the page to re-index.")
         st.markdown("---")
         st.caption(f"N_FFT={N_FFT} | Hop={HOP_LENGTH} | SR={SAMPLE_RATE}")
 
     # ── Load / build database ────────────────────────────
-    db_exists   = os.path.exists(DB_FILE)
+    db_exists   = os.path.exists(DB_FILE) and os.path.exists(META_FILE)
     dir_exists  = os.path.isdir(songs_path)
 
     if not db_exists and not dir_exists:
-        st.error(f"Folder `{songs_path}` not found and no pre-built database "
-                 f"exists. Add your .mp3 files to the `{songs_path}/` folder.")
+        st.error(f"Songs folder `{songs_path}` not found and no database exists.")
         st.stop()
 
     if not dir_exists:
         os.makedirs(songs_path, exist_ok=True)
 
     with st.spinner("Loading fingerprint database…"):
-        db = build_database(songs_folder=songs_path, db_file=DB_FILE)
+        db, meta = build_database(songs_folder=songs_path,
+                                  db_file=DB_FILE,
+                                  meta_file=META_FILE)
 
-    st.sidebar.success(f"DB loaded – {len(db):,} unique hashes.")
+    st.sidebar.success(f"DB loaded – {len(db):,} unique hashes, "
+                       f"{len(meta)} songs.")
 
-    # ── Tabs ─────────────────────────────────────────────
-    tab1, tab2 = st.tabs(["🎤 Single Clip", "📂 Batch Mode"])
+    # ── Three tabs matching demo video ───────────────────
+    tab_lib, tab_id, tab_batch = st.tabs(
+        ["♦ LIBRARY", "⊙ IDENTIFY", "▦ BATCH"]
+    )
 
     # ════════════════════════════════════════════════════
-    #  TAB 1 – SINGLE CLIP
+    #  TAB 1 – LIBRARY  (constellation thumbnails grid)
     # ════════════════════════════════════════════════════
-    with tab1:
-        st.subheader("Upload a Query Clip")
+    with tab_lib:
+        st.subheader("LIBRARY")
+        st.caption("Song indexing is managed by the admin. "
+                   "Drop a clip in the Identify tab to test the library.")
+        st.markdown("---")
+        st.markdown("**IN THE DATABASE**")
+
+        if not meta:
+            st.info("No songs indexed yet. Add .mp3 files to the songs folder.")
+        else:
+            # Display songs in a 4-column grid with constellation thumbnails
+            songs_list = sorted(meta.keys())
+            cols_per_row = 4
+
+            for row_start in range(0, len(songs_list), cols_per_row):
+                row_songs = songs_list[row_start: row_start + cols_per_row]
+                cols = st.columns(cols_per_row)
+
+                for col, song_name in zip(cols, row_songs):
+                    info = meta[song_name]
+                    thumb_bytes = info.get("thumbnail", None)
+                    hash_count  = info.get("hash_count", 0)
+
+                    with col:
+                        if thumb_bytes:
+                            # Convert PNG bytes → base64 for st.markdown img
+                            b64 = base64.b64encode(thumb_bytes).decode()
+                            st.markdown(
+                                f"""
+                                <div class="song-card">
+                                  <img src="data:image/png;base64,{b64}"/>
+                                  <div class="song-title"
+                                       title="{song_name}">{song_name}</div>
+                                  <div class="song-hashes">
+                                    {hash_count:,} hashes
+                                  </div>
+                                </div>
+                                """,
+                                unsafe_allow_html=True
+                            )
+                        else:
+                            st.markdown(
+                                f"""
+                                <div class="song-card">
+                                  <div style="height:80px;background:#21262d;
+                                    border-radius:4px;display:flex;
+                                    align-items:center;justify-content:center;
+                                    color:#484f58;font-size:24px;">♪</div>
+                                  <div class="song-title">{song_name}</div>
+                                  <div class="song-hashes">
+                                    {hash_count:,} hashes
+                                  </div>
+                                </div>
+                                """,
+                                unsafe_allow_html=True
+                            )
+
+    # ════════════════════════════════════════════════════
+    #  TAB 2 – IDENTIFY  (single clip)
+    # ════════════════════════════════════════════════════
+    with tab_id:
+        st.subheader("SEARCH")
+        st.markdown("### Identify a clip")
+
         uploaded = st.file_uploader(
-            "Upload a short .mp3 or .wav clip",
+            "Upload a short clip",
             type=["mp3", "wav", "flac", "ogg"],
-            key="single")
+            key="single",
+            label_visibility="collapsed"
+        )
 
         if uploaded:
             query_bytes = uploaded.read()
             st.audio(query_bytes)
 
-            st.markdown("### 1 · Spectrogram")
-            st.caption("Bright = loud. Each column is one DFT window. "
-                       "A single DFT of the whole song loses all timing info.")
-            y, sr = load_audio(query_bytes)
-            S_db, freqs, times = compute_spectrogram(y, sr)
-            fig = plot_spectrogram(S_db, freqs, times,
-                                   title=f"Spectrogram – {uploaded.name}")
-            st.pyplot(fig); plt.close(fig)
+            with st.spinner("Analysing…"):
+                y, sr = load_audio(query_bytes)
+                best, count, offsets, S_db, freqs, times, peaks = \
+                    match_query(y, sr, db)
 
-            st.markdown("### 2 · Constellation of Peaks")
-            st.caption("Only loud local maxima survive – sparse and noise-robust.")
-            peaks = extract_peaks(S_db)
-            fig = plot_constellation(S_db, freqs, times, peaks,
-                                     title="Constellation (cyan dots)")
-            st.pyplot(fig); plt.close(fig)
+            # ── Intermediate steps ───────────────────────
+            st.markdown("#### Intermediate steps")
 
-            st.markdown("### 3 · Match Result")
-            with st.spinner("Matching against database…"):
-                best, count, offsets, *_ = match_query(y, sr, db)
+            col1, col2 = st.columns(2)
 
-            if best:
-                st.success(f"**Match found:** `{best}`  ({count} aligned hashes)")
-            else:
-                st.warning("No match found.")
+            with col1:
+                st.markdown("**1 · Spectrogram**")
+                st.caption("Each column = one DFT window. "
+                           "Bright = loud. Timing is preserved.")
+                fig = plot_spectrogram(
+                    S_db, freqs, times,
+                    title=f"Spectrogram – {uploaded.name}")
+                st.pyplot(fig); plt.close(fig)
 
+            with col2:
+                st.markdown("**2 · Constellation of Peaks**")
+                st.caption("Sparse set of loud local maxima — "
+                           "robust to background noise.")
+                fig = plot_constellation(
+                    S_db, freqs, times, peaks,
+                    title="Constellation (cyan dots)")
+                st.pyplot(fig); plt.close(fig)
+
+            # ── Offset histogram ─────────────────────────
             if offsets:
-                st.markdown("### 4 · Offset Histogram")
+                st.markdown("**3 · Offset Histogram**")
                 st.caption("True match → one very tall bar. "
                            "Wrong songs → scattered low bars.")
                 fig = plot_offset_histogram(offsets, best)
                 st.pyplot(fig); plt.close(fig)
 
+            # ── Result ───────────────────────────────────
+            st.markdown("---")
+            if best:
+                st.success(f"**MATCH FOUND**")
+                st.markdown(f"## 🎵 {best}")
+                st.metric("Aligned hashes", count)
+
+                # Show the library thumbnail of the matched song
+                if best in meta and meta[best].get("thumbnail"):
+                    b64 = base64.b64encode(
+                        meta[best]["thumbnail"]).decode()
+                    st.markdown(
+                        f'<img src="data:image/png;base64,{b64}" '
+                        f'style="width:300px;border-radius:8px;'
+                        f'border:1px solid #30363d"/>',
+                        unsafe_allow_html=True
+                    )
+            else:
+                st.warning("No match found in the database.")
+
     # ════════════════════════════════════════════════════
-    #  TAB 2 – BATCH MODE
+    #  TAB 3 – BATCH MODE
     # ════════════════════════════════════════════════════
-    with tab2:
-        st.subheader("Batch Identification")
+    with tab_batch:
+        st.subheader("BATCH")
+        st.markdown("### Identify many clips at once")
+        st.markdown(
+            "Upload a set of query clips. Each is identified against the "
+            "**currently indexed library**, and the results are written to a "
+            "standardised `results.csv` with columns `filename`, `prediction`. "
+            "The `prediction` is the matched track's filename without its "
+            "extension, or `unknown` when no candidate clears the confidence "
+            "threshold."
+        )
+
         batch_files = st.file_uploader(
-            "Upload multiple clips",
+            "Upload clips",
             type=["mp3", "wav", "flac", "ogg"],
             accept_multiple_files=True,
-            key="batch")
+            key="batch",
+            label_visibility="collapsed"
+        )
 
-        if batch_files and st.button("▶ Run Batch"):
+        if batch_files and st.button("▶ Run batch"):
             with st.spinner("Processing…"):
                 rows = run_batch_mode(batch_files, db)
             st.dataframe(rows, use_container_width=True)
             csv_path = write_results_csv(rows)
             with open(csv_path, "rb") as f:
-                st.download_button("⬇ Download results.csv",
-                                   data=f.read(),
-                                   file_name="results.csv",
-                                   mime="text/csv")
+                st.download_button(
+                    "⬇ Download results.csv",
+                    data=f.read(),
+                    file_name="results.csv",
+                    mime="text/csv"
+                )
 
 
 if __name__ == "__main__":
